@@ -146,6 +146,7 @@ def finetune(sess,
              optimizer='adam',
              overwrite=False,
              target_loss=None,
+             sample_size=1024,
              reuse=False):
     """Finetunes the model on the given dataset.
 
@@ -310,7 +311,7 @@ def finetune(sess,
             fp.write('\n'.join(all_text))
 
     def sample_batch():
-        return [data_sampler.sample(1024) for _ in range(batch_size)]
+        return [data_sampler.sample(sample_size) for _ in range(batch_size)]
 
     if overwrite and restore_from == 'latest':
         for file in files:
