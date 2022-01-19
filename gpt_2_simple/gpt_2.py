@@ -359,7 +359,7 @@ def finetune(sess,
                         loss=v_loss,
                         avg=avg_loss[0] / avg_loss[1]))
 
-            if (v_loss <= target_loss):
+            if (target_loss != None and v_loss <= target_loss):
               save()
               return
 
