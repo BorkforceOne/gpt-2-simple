@@ -1,26 +1,16 @@
-import tarfile
 import os
 import json
 import requests
-import sys
 import shutil
 import re
-from tqdm import tqdm, trange
+from tqdm import tqdm
 import numpy as np
 import tensorflow as tf
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python.client import device_lib
 import time
-from datetime import datetime
 import csv
-import argparse
 from sys import exit
-
-# if in Google Colaboratory
-try:
-    from google.colab import drive
-except:
-    pass
 
 from gpt_2_simple.src import model, sample, encoder, memory_saving_gradients
 from gpt_2_simple.src.load_dataset import load_dataset, Sampler
@@ -122,9 +112,11 @@ def get_available_gpus():
     local_device_protos = device_lib.list_local_devices()
     return [x.name for x in local_device_protos if x.device_type == 'GPU']
 
-def finetune(sess,
+
+class Finetune:
+    def __init__(self,
+             sess,
              dataset,
-             steps=-1,
              model_name='124M',
              model_dir='models',
              combine=50000,
@@ -134,11 +126,7 @@ def finetune(sess,
              restore_from='latest',
              run_name='run1',
              checkpoint_dir='checkpoint',
-             sample_every=100,
-             sample_length=1023,
-             sample_num=1,
              multi_gpu=False,
-             save_every=1000,
              print_every=1,
              max_checkpoints=1,
              use_memory_saving_gradients=False,
@@ -148,226 +136,187 @@ def finetune(sess,
              target_loss=None,
              sample_size=1024,
              reuse=False):
-    """Finetunes the model on the given dataset.
+        self.sess = sess
+        self.dataset = dataset
+        self.model_name = model_name
+        self.model_dir = model_dir
+        self.combine = combine
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.accumulate_gradients = accumulate_gradients
+        self.restore_from = restore_from
+        self.run_name = run_name
+        self.checkpoint_dir = checkpoint_dir
+        self.multi_gpu = multi_gpu
+        self.print_every = print_every
+        self.max_checkpoints = max_checkpoints
+        self.use_memory_saving_gradients = use_memory_saving_gradients
+        self.only_train_transformer_layers = only_train_transformer_layers
+        self.optimizer = optimizer
+        self.overwrite = overwrite
+        self.target_loss = target_loss
+        self.sample_size = sample_size
+        self.reuse = reuse
+        self.avg_loss = (0.0, 0.0)
 
-    Adapted from https://github.com/nshepperd/gpt-2/blob/finetuning/train.py.
-    See that file for parameter definitions.
-    """
-
-    # assert model_name not in ['774M', '1558M'] or multi_gpu, "Currently, a modern single GPU cannot finetune the 774M GPT-2 model or larger."
-
-    SAMPLE_DIR = 'samples'
-
-    checkpoint_path = os.path.join(checkpoint_dir, run_name)
-
-    def maketree(path):
+    def maketree_(self, path):
         try:
             os.makedirs(path)
         except:
             pass
 
-    maketree(checkpoint_path)
-    files = [f for f in os.listdir(checkpoint_path)]
-    for file in ['hparams.json', 'encoder.json', 'vocab.bpe']:
-        try:
-            shutil.copyfile(os.path.join(model_dir, model_name, file),
-                            os.path.join(checkpoint_path, file))
-        except FileNotFoundError as fnf_error:
-            print("You need to download the GPT-2 model first via download_gpt2()")
-            raise(fnf_error)
+    def init(self):
+        self.checkpoint_path = os.path.join(self.checkpoint_dir, self.run_name)
 
-    enc = encoder.get_encoder(checkpoint_path)
-    hparams = model.default_hparams()
-    with open(os.path.join(checkpoint_path, 'hparams.json')) as f:
-        hparams.override_from_dict(json.load(f))
+        self.maketree_(self.checkpoint_path)
+        self.files = [f for f in os.listdir(self.checkpoint_path)]
+        for file in ['hparams.json', 'encoder.json', 'vocab.bpe']:
+            try:
+                shutil.copyfile(os.path.join(self.model_dir, self.model_name, file),
+                                os.path.join(self.checkpoint_path, file))
+            except FileNotFoundError as fnf_error:
+                print("You need to download the GPT-2 model first via download_gpt2()")
+                raise(fnf_error)
 
-    if sample_length > hparams.n_ctx:
-        raise ValueError(
-            "Can't get samples longer than window size: %s" % hparams.n_ctx)
+        enc = encoder.get_encoder(self.checkpoint_path)
+        hparams = model.default_hparams()
+        with open(os.path.join(self.checkpoint_path, 'hparams.json')) as f:
+            hparams.override_from_dict(json.load(f))
 
-    if model_name not in ['117M', '124M']:
-        print('For larger models, the recommended finetune() parameters are:')
-        print('\tuse_memory_saving_gradients = True')
-        print('\tonly_train_transformer_layers = True')
-        print('\taccumulate_gradients = 1\n')
+        if self.model_name not in ['117M', '124M']:
+            print('For larger models, the recommended finetune() parameters are:')
+            print('\tuse_memory_saving_gradients = True')
+            print('\tonly_train_transformer_layers = True')
+            print('\taccumulate_gradients = 1\n')
 
-    context = tf.compat.v1.placeholder(tf.int32, [batch_size, None])
-    gpus = []
+        self.context = tf.compat.v1.placeholder(tf.int32, [self.batch_size, None])
+        gpus = []
 
-    if multi_gpu:
-        gpus = get_available_gpus()
+        if self.multi_gpu:
+            gpus = get_available_gpus()
 
-    output = model.model(hparams=hparams, X=context, gpus=gpus, reuse=reuse)
-    loss = tf.reduce_mean(
-        input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(
-            labels=context[:, 1:], logits=output['logits'][:, :-1]))
+        self.output = model.model(hparams=hparams, X=self.context, gpus=gpus, reuse=self.reuse)
+        self.loss = tf.reduce_mean(
+            input_tensor=tf.nn.sparse_softmax_cross_entropy_with_logits(
+                labels=self.context[:, 1:], logits=self.output['logits'][:, :-1]))
 
-    tf_sample = sample.sample_sequence(
-        hparams=hparams,
-        length=sample_length,
-        context=context,
-        batch_size=batch_size,
-        temperature=1.0,
-        top_k=40)
+        all_vars = [v for v in tf.compat.v1.trainable_variables() if 'model' in v.name]
+        train_vars = [v for v in all_vars if '/h' in v.name] if self.only_train_transformer_layers else all_vars
 
-    all_vars = [v for v in tf.compat.v1.trainable_variables() if 'model' in v.name]
-    train_vars = [v for v in all_vars if '/h' in v.name] if only_train_transformer_layers else all_vars
+        if self.optimizer == 'adam':
+            opt = tf.compat.v1.train.AdamOptimizer(learning_rate=self.learning_rate)
+        elif self.optimizer == 'sgd':
+            opt = tf.compat.v1.train.GradientDescentOptimizer(learning_rate=self.learning_rate)
 
-    if optimizer == 'adam':
-        opt = tf.compat.v1.train.AdamOptimizer(learning_rate=learning_rate)
-    elif optimizer == 'sgd':
-        opt = tf.compat.v1.train.GradientDescentOptimizer(learning_rate=learning_rate)
+        if tf.__version__ >= '2.0.0' and self.use_memory_saving_gradients:
+            exit("Memory saving gradients are not implemented for Tensorflow 2 yet.")
 
-    if tf.__version__ >= '2.0.0' and use_memory_saving_gradients:
-        exit("Memory saving gradients are not implemented for Tensorflow 2 yet.")
-
-    if accumulate_gradients > 1:
-        if use_memory_saving_gradients:
-            exit("Memory saving gradients are not implemented for gradient accumulation yet.")
-        opt = AccumulatingOptimizer(
-            opt=opt,
-            var_list=train_vars)
-        opt_reset = opt.reset()
-        opt_compute = opt.compute_gradients(loss)
-        opt_apply = opt.apply_gradients()
-        summary_loss = tf.compat.v1.summary.scalar('loss', opt_apply)
-    else:
-        if use_memory_saving_gradients:
-            opt_grads = memory_saving_gradients.gradients(loss, train_vars)
+        if self.accumulate_gradients > 1:
+            if self.use_memory_saving_gradients:
+                exit("Memory saving gradients are not implemented for gradient accumulation yet.")
+            opt = AccumulatingOptimizer(
+                opt=opt,
+                var_list=train_vars)
+            self.opt_reset = opt.reset()
+            self.opt_compute = opt.compute_gradients(self.loss)
+            self.opt_apply = opt.apply_gradients()
+            self.summary_loss = tf.compat.v1.summary.scalar('loss', self.opt_apply)
         else:
-            opt_grads = tf.gradients(ys=loss, xs=train_vars)
-        opt_grads = list(zip(opt_grads, train_vars))
-        opt_apply = opt.apply_gradients(opt_grads)
-        summary_loss = tf.compat.v1.summary.scalar('loss', loss)
+            if self.use_memory_saving_gradients:
+                opt_grads = memory_saving_gradients.gradients(self.loss, train_vars)
+            else:
+                opt_grads = tf.gradients(ys=self.loss, xs=train_vars)
+            opt_grads = list(zip(opt_grads, train_vars))
+            self.opt_apply = opt.apply_gradients(opt_grads)
+            self.summary_loss = tf.compat.v1.summary.scalar('loss', self.loss)
 
-    summary_log = tf.compat.v1.summary.FileWriter(checkpoint_path)
+        self.summary_log = tf.compat.v1.summary.FileWriter(self.checkpoint_path)
 
-    saver = tf.compat.v1.train.Saver(
-        var_list=all_vars,
-        max_to_keep=max_checkpoints)
-    sess.run(tf.compat.v1.global_variables_initializer())
+        self.saver = tf.compat.v1.train.Saver(
+            var_list=all_vars,
+            max_to_keep=self.max_checkpoints)
+        self.sess.run(tf.compat.v1.global_variables_initializer())
 
-    if restore_from == 'latest':
-        ckpt = tf.train.latest_checkpoint(checkpoint_path)
-        if ckpt is None:
-            # Get fresh GPT weights if new run.
+        if self.restore_from == 'latest':
+            ckpt = tf.train.latest_checkpoint(self.checkpoint_path)
+            if ckpt is None:
+                # Get fresh GPT weights if new run.
+                ckpt = tf.train.latest_checkpoint(
+                    os.path.join(self.model_dir, self.model_name))
+        elif self.restore_from == 'fresh':
             ckpt = tf.train.latest_checkpoint(
-                os.path.join(model_dir, model_name))
-    elif restore_from == 'fresh':
-        ckpt = tf.train.latest_checkpoint(
-            os.path.join(model_dir, model_name))
-    else:
-        ckpt = tf.train.latest_checkpoint(restore_from)
-    print('Loading checkpoint', ckpt)
-    saver.restore(sess, ckpt)
+                os.path.join(self.model_dir, self.model_name))
+        else:
+            ckpt = tf.train.latest_checkpoint(self.restore_from)
+        print('Loading checkpoint', ckpt)
+        self.saver.restore(self.sess, ckpt)
 
-    print('Loading dataset...')
-    chunks = load_dataset(enc, dataset, combine)
-    data_sampler = Sampler(chunks)
-    print('dataset has', data_sampler.total_size, 'tokens')
-    print('Training...')
+        print('Loading dataset...')
+        chunks = load_dataset(enc, self.dataset, self.combine)
+        self.data_sampler = Sampler(chunks)
+        print('dataset has', self.data_sampler.total_size, 'tokens')
 
-    counter = 1
-    counter_path = os.path.join(checkpoint_path, 'counter')
-    if os.path.exists(counter_path) and restore_from == 'latest':
-        # Load the step number if we're resuming a run
-        # Add 1 so we don't immediately try to save again
-        with open(counter_path, 'r') as fp:
-            counter = int(fp.read()) + 1
-    counter_base = counter
+        # Load counter info
+        self.counter = 1
+        self.counter_path = os.path.join(self.checkpoint_path, 'counter')
+        if os.path.exists(self.counter_path) and self.restore_from == 'latest':
+            # Load the step number if we're resuming a run
+            # Add 1 so we don't immediately try to save again
+            with open(self.counter_path, 'r') as fp:
+                self.counter = int(fp.read()) + 1
+        
+        self.counter_base = self.counter
+        self.start_time = time.time()
 
-    def save():
-        maketree(checkpoint_path)
+    def save(self):
+        self.maketree_(self.checkpoint_path)
         print(
             'Saving',
-            os.path.join(checkpoint_path,
-                         'model-{}').format(counter-1))
-        saver.save(
-            sess,
-            os.path.join(checkpoint_path, 'model'),
-            global_step=counter-1)
-        with open(counter_path, 'w') as fp:
-            fp.write(str(counter-1) + '\n')
+            os.path.join(self.checkpoint_path,
+                        'model-{}').format(self.counter-1))
+        self.saver.save(
+            self.sess,
+            os.path.join(self.checkpoint_path, 'model'),
+            global_step=self.counter-1)
+        with open(self.counter_path, 'w') as fp:
+            fp.write(str(self.counter-1) + '\n')
 
-    def generate_samples():
-        context_tokens = data_sampler.sample(1)
-        all_text = []
-        index = 0
-        while index < sample_num:
-            out = sess.run(
-                tf_sample,
-                feed_dict={context: batch_size * [context_tokens]})
-            for i in range(min(sample_num - index, batch_size)):
-                text = enc.decode(out[i])
-                text = '======== SAMPLE {} ========\n{}\n'.format(
-                    index + 1, text)
-                all_text.append(text)
-                index += 1
-        print(text)
-        maketree(os.path.join(SAMPLE_DIR, run_name))
-        with open(
-                os.path.join(SAMPLE_DIR, run_name,
-                             'samples-{}').format(counter), 'w') as fp:
-            fp.write('\n'.join(all_text))
+    def train(self):
+        def sample_batch():
+            return [self.data_sampler.sample(self.sample_size) for _ in range(self.batch_size)]
 
-    def sample_batch():
-        return [data_sampler.sample(sample_size) for _ in range(batch_size)]
+        if self.overwrite and self.restore_from == 'latest':
+            for file in self.files:
+                if file.startswith('model') or file.startswith('events'):
+                    os.remove(os.path.join(self.checkpoint_path, file))
+            self.save()
 
-    if overwrite and restore_from == 'latest':
-        for file in files:
-            if file.startswith('model') or file.startswith('events'):
-                os.remove(os.path.join(checkpoint_path, file))
-        save()
+        if self.accumulate_gradients > 1:
+            self.sess.run(self.opt_reset)
+            for _ in range(self.accumulate_gradients):
+                self.sess.run(
+                    self.opt_compute, feed_dict={self.context: sample_batch()})
+            (v_loss, v_summary) = self.sess.run((self.opt_apply, self.summary_loss))
+        else:
+            (_, v_loss, v_summary) = self.sess.run(
+                (self.opt_apply, self.loss, self.summary_loss),
+                feed_dict={self.context: sample_batch()})
 
-    avg_loss = (0.0, 0.0)
-    start_time = time.time()
+        self.summary_log.add_summary(v_summary, self.counter)
 
-    if steps:
-        steps = int(steps)
+        if self.counter % self.print_every == 0:
+            self.avg_loss = (self.avg_loss[0] * 0.99 + v_loss,
+                        self.avg_loss[1] * 0.99 + 1.0)
 
-    try:
-        while True:
-            if steps > 0 and counter == (counter_base + steps):
-                save()
-                return
-            if (counter - 1) % save_every == 0 and counter > 1:
-                save()
-            if (counter - 1) % sample_every == 0 and counter > 1:
-                generate_samples()
+            print(
+                '[{counter} | {time:2.2f}] loss={loss:2.2f} avg={avg:2.2f}'
+                .format(
+                    counter=self.counter,
+                    time=time.time() - self.start_time,
+                    loss=v_loss,
+                    avg=self.avg_loss[0] / self.avg_loss[1]))
 
-            if accumulate_gradients > 1:
-                sess.run(opt_reset)
-                for _ in range(accumulate_gradients):
-                    sess.run(
-                        opt_compute, feed_dict={context: sample_batch()})
-                (v_loss, v_summary) = sess.run((opt_apply, summary_loss))
-            else:
-                (_, v_loss, v_summary) = sess.run(
-                    (opt_apply, loss, summary_loss),
-                    feed_dict={context: sample_batch()})
-
-            summary_log.add_summary(v_summary, counter)
-
-            if counter % print_every == 0:
-                avg_loss = (avg_loss[0] * 0.99 + v_loss,
-                            avg_loss[1] * 0.99 + 1.0)
-
-                print(
-                    '[{counter} | {time:2.2f}] loss={loss:2.2f} avg={avg:2.2f}'
-                    .format(
-                        counter=counter,
-                        time=time.time() - start_time,
-                        loss=v_loss,
-                        avg=avg_loss[0] / avg_loss[1]))
-
-            if (target_loss != None and v_loss <= target_loss):
-              save()
-              return
-
-            counter += 1
-    except KeyboardInterrupt:
-        print('interrupted')
-        save()
+        self.counter += 1
 
 
 def load_gpt2(sess,
@@ -560,85 +509,6 @@ def generate_to_file(sess,
              include_prefix=include_prefix)
 
 
-def mount_gdrive():
-    """Mounts the user's Google Drive in Colaboratory."""
-    assert 'google.colab' in sys.modules, "You must be in Colaboratory to mount your Google Drive"
-
-    drive.mount('/content/drive')
-
-
-def is_mounted():
-    """Checks if the Google Drive is mounted."""
-    assert os.path.isdir('/content/drive'), "You must mount first using mount_gdrive()"
-
-
-def get_tarfile_name(checkpoint_folder):
-    """Converts a folder path into a filename for a .tar archive"""
-    tarfile_name = checkpoint_folder.replace(os.path.sep, '_') + '.tar'
-
-    return tarfile_name
-
-
-def copy_checkpoint_to_gdrive(run_name='run1', copy_folder=False):
-    """Copies the checkpoint folder to a mounted Google Drive."""
-    is_mounted()
-
-    checkpoint_folder = os.path.join('checkpoint', run_name)
-
-    if copy_folder:
-        shutil.copytree(checkpoint_folder, "/content/drive/My Drive/" + checkpoint_folder)
-    else:
-        file_path = get_tarfile_name(checkpoint_folder)
-
-        # Reference: https://stackoverflow.com/a/17081026
-        with tarfile.open(file_path, 'w') as tar:
-            tar.add(checkpoint_folder)
-
-        shutil.copyfile(file_path, "/content/drive/My Drive/" + file_path)
-
-
-def copy_checkpoint_from_gdrive(run_name='run1', copy_folder=False):
-    """Copies the checkpoint folder from a mounted Google Drive."""
-    is_mounted()
-
-    checkpoint_folder = os.path.join('checkpoint', run_name)
-
-    if copy_folder:
-        shutil.copytree("/content/drive/My Drive/" + checkpoint_folder, checkpoint_folder)
-    else:
-        file_path = get_tarfile_name(checkpoint_folder)
-
-        shutil.copyfile("/content/drive/My Drive/" + file_path, file_path)
-
-        with tarfile.open(file_path, 'r') as tar:
-            tar.extractall()
-
-
-def copy_file_to_gdrive(file_path):
-    """Copies a file to a mounted Google Drive."""
-    is_mounted()
-
-    shutil.copyfile(file_path, "/content/drive/My Drive/" + file_path)
-
-
-def copy_file_from_gdrive(file_path):
-    """Copies a file from a mounted Google Drive."""
-    is_mounted()
-
-    shutil.copyfile("/content/drive/My Drive/" + file_path, file_path)
-
-
-def is_gpt2_downloaded(model_dir='models', model_name='124M'):
-    """Checks if the original model + associated files are present in folder."""
-
-    for filename in ['checkpoint', 'encoder.json', 'hparams.json',
-                     'model.ckpt.data-00000-of-00001', 'model.ckpt.index',
-                     'model.ckpt.meta', 'vocab.bpe']:
-        if not os.path.isfile(os.path.join(model_dir, model_name, filename)):
-            return False
-    return True
-
-
 def encode_csv(csv_path, out_path='csv_encoded.txt', header=True,
                start_token="<|startoftext|>",
                end_token="<|endoftext|>"):
@@ -671,184 +541,3 @@ def encode_dataset(file_path, model_dir='models', out_path='text_encoded.npz',
     print('Writing', out_path)
     np.savez_compressed(out_path, *chunks)
 
-
-def cmd():
-    """Function called when invoking from the terminal."""
-
-    parser = argparse.ArgumentParser(
-        description="Easily retrain OpenAI's GPT-2 text-generating model on new texts. (https://github.com/minimaxir/gpt-2-simple)"
-    )
-
-    # Explicit arguments
-
-    parser.add_argument(
-        '--mode', help='Mode for using the CLI (either "finetune" or "generate") [Required]', nargs='?')
-    parser.add_argument(
-        '--run_name',  help="[finetune/generate] Run number to save/load the model",
-        nargs='?', default='run1')
-    parser.add_argument(
-        '--checkpoint_dir', help="[finetune] Path of the checkpoint directory",
-        nargs='?', default='checkpoint')
-    parser.add_argument(
-        '--model_name',  help="[finetune] Name of the GPT-2 model to finetune",
-        nargs='?', default='124M')
-    parser.add_argument(
-        '--model_dir', help="[finetune] Path of directory of the GPT-2 model to finetune",
-        nargs='?', default='models')
-    parser.add_argument(
-        '--dataset',  help="[finetune] Path to the source text.",
-        nargs='?', default=None)
-    parser.add_argument(
-        '--steps',  help="[finetune] Number of steps to train (-1 for infinite)",
-        nargs='?', default=-1)
-    parser.add_argument(
-        '--restore_from',  help="[finetune] Whether to load model 'fresh' or from 'latest' checkpoint.",
-        nargs='?', default='latest')
-    parser.add_argument(
-        '--sample_every',  help="[finetune] After how many steps to print sample",
-        nargs='?', default=1000000, type=int)
-    parser.add_argument(
-        '--save_every',  help="[finetune] After how many steps to save checkpoint",
-        nargs='?', default=100, type=int)
-    parser.add_argument(
-        '--print_every',  help="[finetune] After how many steps to print progress",
-        nargs='?', default=10, type=int)
-    parser.add_argument(
-        '--optimizer',  help="[finetune] Optimizer to use for finetuning (adam or sgd)",
-        nargs='?', default='adam')
-    parser.add_argument(
-        '--overwrite',  help="[finetune] Overwrite existing model when continuing training",
-        nargs='?', default=False, type=lambda x: (str(x).lower() == 'true'))
-    parser.add_argument(
-        '--nfiles',  help="[generate] How many files to generate.",
-        nargs='?', default=1, type=int)
-    parser.add_argument(
-        '--nsamples',  help="[generate] How many texts to generate.",
-        nargs='?', default=1, type=int)
-    parser.add_argument(
-        '--folder',  help="[generate] Folder to save the generated files",
-        nargs='?', default="gen", type=str)
-    parser.add_argument(
-        '--length',  help="[generate] Length (tokens) of the generated texts",
-        nargs='?', default=1023, type=int)
-    parser.add_argument(
-        '--temperature',  help="[generate] Temperature of the generated texts",
-        nargs='?', default=0.7, type=float)
-    parser.add_argument(
-        '--top_k',  help="[generate] Sample only from top k tokens",
-        nargs='?', default=0, type=int)
-    parser.add_argument(
-        '--top_p',  help="[generate] Sample from top p prob (overrides top_k if nonzero)",
-        nargs='?', default=0.0, type=float)
-    parser.add_argument(
-        '--batch_size',  help="[generate] Batch size for generation (increase for GPUs)",
-        nargs='?', default=1, type=int)
-    parser.add_argument(
-        '--prefix',  help="[generate] Prefix for generated texts",
-        nargs='?', default=None)
-    parser.add_argument(
-        '--truncate',  help="[generate] Truncation for generated texts",
-        nargs='?', default=None)
-    # https://stackoverflow.com/a/46951029
-    parser.add_argument(
-        '--include_prefix',  help="[generate] Include prefix when truncating.",
-        nargs='?', default=True, type=lambda x: (str(x).lower() == 'true'))
-    parser.add_argument(
-        '--sample_delim',  help="[generate] Delimiter between each generated sample.",
-        nargs='?', default='=' * 20 + '\n', type=str)
-    parser.add_argument(
-        '--multi_gpu',  help="[generate/finetune] Attempt to allocate multiple GPUs for running.",
-        nargs='?', default=True, type=lambda x: (str(x).lower() == 'true'))
-
-    # Positional arguments
-    parser.add_argument('mode', nargs='?')
-    parser.add_argument('dataset', nargs='?')
-
-    args = parser.parse_args()
-    assert args.mode in ['finetune', 'generate'], "Mode must be 'finetune' or 'generate'"
-
-    if args.mode == 'finetune':
-        assert args.dataset is not None, "You need to provide a dataset."
-
-        cmd_finetune(dataset=args.dataset, run_name=args.run_name,
-                     checkpoint_dir=args.checkpoint_dir,
-                     model_name=args.model_name,
-                     model_dir=args.model_dir,
-                     steps=args.steps, restore_from=args.restore_from,
-                     sample_every=args.sample_every,
-                     save_every=args.save_every,
-                     print_every=args.print_every,
-                     optimizer=args.optimizer,
-                     overwrite=args.overwrite,
-                     multi_gpu=args.multi_gpu)
-    if args.mode == "generate":
-        cmd_generate(nfiles=args.nfiles, nsamples=args.nsamples,
-                     folder=args.folder, length=args.length,
-                     temperature=args.temperature, batch_size=args.batch_size,
-                     prefix=args.prefix, truncate=args.truncate,
-                     include_prefix=args.include_prefix,
-                     sample_delim=args.sample_delim, run_name=args.run_name,
-                     checkpoint_dir=args.checkpoint_dir,
-                     top_k=args.top_k, top_p=args.top_p, multi_gpu=args.multi_gpu)
-
-
-def cmd_finetune(dataset, run_name, checkpoint_dir, model_name, model_dir, steps,
-                 restore_from, sample_every,
-                 save_every, print_every, optimizer, overwrite, multi_gpu):
-    """Wrapper script for finetuning the model via the CLI."""
-
-    if not is_gpt2_downloaded(model_dir=model_dir, model_name=model_name):
-        download_gpt2(model_dir=model_dir, model_name=model_name)
-
-    sess = start_tf_sess()
-    finetune(sess, dataset=dataset, run_name=run_name,
-             checkpoint_dir=checkpoint_dir,
-             model_name=model_name,
-             model_dir=model_dir,
-             steps=steps, restore_from=restore_from,
-             sample_every=sample_every, save_every=save_every,
-             print_every=print_every,
-             optimizer=optimizer,
-             overwrite=overwrite,
-             multi_gpu=multi_gpu)
-
-
-def cmd_generate(nfiles, nsamples, folder,
-                 length, temperature, batch_size,
-                 prefix, truncate, include_prefix,
-                 sample_delim, run_name,
-                 checkpoint_dir,
-                 top_k, top_p, multi_gpu):
-    """Wrapper script for generating text via the CLI.
-    The files are generated into a folder, which can be downloaded
-    recursively by downloading the entire folder.
-    """
-
-    sess = start_tf_sess()
-    load_gpt2(sess, run_name=run_name, checkpoint_dir=checkpoint_dir, multi_gpu=multi_gpu)
-
-    try:
-        os.mkdir(folder)
-    except:
-        shutil.rmtree(folder)
-        os.mkdir(folder)
-
-    for _ in trange(nfiles):
-        gen_file = os.path.join(folder,
-                    'gpt2_gentext_{:%Y%m%d_%H%M%S}.txt'.format(datetime.utcnow()))
-
-        generate_to_file(sess,
-                         run_name=run_name,
-                         checkpoint_dir=checkpoint_dir,
-                         destination_path=gen_file,
-                         length=length,
-                         temperature=temperature,
-                         nsamples=nsamples,
-                         batch_size=batch_size,
-                         prefix=prefix,
-                         truncate=truncate,
-                         include_prefix=include_prefix,
-                         sample_delim=sample_delim,
-                         top_k=top_k,
-                         top_p=top_p
-                         )
